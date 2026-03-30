@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useCallback } from "react";
 import {
   prepareWithSegments,
   layoutNextLine,
@@ -8,83 +8,64 @@ import {
   type LayoutCursor,
 } from "@chenglou/pretext";
 import { useAudio } from "./AudioProvider";
+import { TIMED_WORDS, LYRICS_TEXT, WORD_CHAR_STARTS, getCurrentWordIndex } from "./lyrics-data";
 
-const DEFAULT_LYRICS = `I've been searchin' for a feeling like that
-One that makes me feel like I'm on top of the world
-And I'm never coming down
-Every beat is like a heartbeat pounding through me
-Every note is like a signal from the universe
-Telling me to let it out
+// ── Constants ─────────────────────────────────────────────────────
+const FONT_SIZES = [24, 28, 32] as const;
+const LINE_HEIGHTS = [34, 40, 46] as const;
+const PADDING = 60;
+const BLOB_POINTS = 128; // resolution of the blob outline
+const BASE_RADIUS = 160; // blob radius at silence
+const NUM_RINGS = 3;
+const MAX_PARTICLES = 120;
 
-The sound waves carry me away
-Through every word I want to say
-The rhythm pulls me closer now
-I feel the music all around
-
-Lost in the frequency tonight
-Every syllable ignites
-The bass line hits beneath my feet
-And makes the silence obsolete
-
-We're all just wavelengths in the dark
-Searching for a place to start
-The melody becomes the map
-That leads us through the noise and back
-
-Turn it up and let it breathe
-Let the chorus set you free
-Every lyric finds its home
-When the speakers hit that tone
-
-The treble dances overhead
-Like every word that's left unsaid
-The subwoofer rumbles deep below
-A language only hearts can know
-
-So let the audio unfold
-Let every story find its told
-The music bends around the light
-And fills the spaces of the night
-
-We ride the waveform to the end
-Where silence waits to start again
-But until then we let it play
-And let the sound waves lead the way`;
-
-const FONT = "17px Inter, system-ui, sans-serif";
-const LINE_HEIGHT = 28;
-const PADDING = 40;
+type Particle = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;    // 0→1, dies at 1
+  maxLife: number;  // total lifetime in "frames"
+  size: number;
+  alpha: number;
+};
 
 export function AudioReflowCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const preparedRef = useRef<PreparedTextWithSegments | null>(null);
+  // Prepared text at 3 font sizes for dynamic sizing
+  const preparedRefs = useRef<(PreparedTextWithSegments | null)[]>([null, null, null]);
   const rafRef = useRef<number>(0);
-  const timeRef = useRef<number>(0);
-  const [lyrics, setLyrics] = useState(DEFAULT_LYRICS);
-  const [showInput, setShowInput] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const isDraggingRef = useRef(false);
+  const smoothedFreqRef = useRef<Float32Array | null>(null);
+  const timeRef = useRef(0);
+  const smoothAmpRef = useRef(0);
+  const smoothScaleRef = useRef(1);
+  const smoothFontIdxRef = useRef(1); // smoothed index into FONT_SIZES
 
-  const { isPlaying, fileName, play, pause, loadFile, analyserRef, frequencyDataRef } = useAudio();
+  // Persistent blob point radii for smooth animation
+  const blobRadiiRef = useRef<Float32Array | null>(null);
 
-  // Re-prepare text when lyrics change
+  // Particle system
+  const particlesRef = useRef<Particle[]>([]);
+  const lastWordIdxRef = useRef(-1);
+
+  const { analyserRef, frequencyDataRef, audioRef } = useAudio();
+
   useEffect(() => {
-    document.fonts.ready.then(() => {
-      preparedRef.current = prepareWithSegments(lyrics, FONT);
-    });
-  }, [lyrics]);
+    for (let i = 0; i < FONT_SIZES.length; i++) {
+      const font = `${FONT_SIZES[i]}px system-ui, sans-serif`;
+      preparedRefs.current[i] = prepareWithSegments(LYRICS_TEXT, font, { whiteSpace: "pre-wrap" });
+    }
+  }, []);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
-    const prepared = preparedRef.current;
-    if (!canvas || !prepared) {
+    const allPrepared = preparedRefs.current;
+    if (!canvas || !allPrepared[0] || !allPrepared[1] || !allPrepared[2]) {
       rafRef.current = requestAnimationFrame(draw);
       return;
     }
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
+    const ctx = canvas.getContext("2d")!;
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
     const w = rect.width;
@@ -95,250 +76,508 @@ export function AudioReflowCanvas() {
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, w, h);
 
-    // Get frequency data if audio is playing
+    // ── Audio analysis ────────────────────────────────────────
     const analyser = analyserRef.current;
     const freqData = frequencyDataRef.current;
     let hasAudio = false;
 
     if (analyser && freqData) {
       analyser.getByteFrequencyData(freqData);
-      // Check if there's actual audio data
       for (let i = 0; i < freqData.length; i++) {
-        if (freqData[i] > 0) { hasAudio = true; break; }
+        if (freqData[i] > 5) { hasAudio = true; break; }
+      }
+      if (!smoothedFreqRef.current || smoothedFreqRef.current.length !== freqData.length) {
+        smoothedFreqRef.current = new Float32Array(freqData.length);
+      }
+      const sm = smoothedFreqRef.current;
+      for (let i = 0; i < freqData.length; i++) {
+        sm[i] = sm[i] * 0.7 + freqData[i] * 0.3;
       }
     }
 
-    timeRef.current += 0.012;
+    timeRef.current += 0.008;
     const t = timeRef.current;
+    const smoothed = smoothedFreqRef.current;
+    const audioTime = audioRef.current?.currentTime ?? 0;
+    const currentWordIdx = getCurrentWordIndex(audioTime);
+    const cx = w / 2;
+    const cy = h / 2;
 
+    // Overall amplitude
+    let rawAmp = 0;
+    if (smoothed) {
+      let sum = 0;
+      for (let i = 0; i < smoothed.length; i++) sum += smoothed[i];
+      rawAmp = sum / smoothed.length / 255;
+    }
+    smoothAmpRef.current += (rawAmp - smoothAmpRef.current) * 0.15;
+    const amp = smoothAmpRef.current;
+
+    // Word scale
+    const targetScale = 1 + amp * 0.15;
+    const lerpSpeed = targetScale > smoothScaleRef.current ? 0.3 : 0.1;
+    smoothScaleRef.current += (targetScale - smoothScaleRef.current) * lerpSpeed;
+    const wordScale = smoothScaleRef.current;
+
+    // ── Dynamic font sizing ──────────────────────────────────
+    // Map amplitude to font size index: 0=small, 1=medium, 2=large
+    const targetFontIdx = Math.min(2, amp * 3);
+    smoothFontIdxRef.current += (targetFontIdx - smoothFontIdxRef.current) * 0.1;
+    const fontIdx = Math.round(Math.max(0, Math.min(2, smoothFontIdxRef.current)));
+    const prepared = allPrepared[fontIdx]!;
+    const fontSize = FONT_SIZES[fontIdx];
+    const lineHeight = LINE_HEIGHTS[fontIdx];
+    const font = `${fontSize}px system-ui, sans-serif`;
+
+    // ── Blob waveform ─────────────────────────────────────────
+    // Each point around the circle maps to a frequency bin.
+    // The radius at that angle is BASE_RADIUS + displacement from audio.
+    if (!blobRadiiRef.current) {
+      blobRadiiRef.current = new Float32Array(BLOB_POINTS).fill(BASE_RADIUS);
+    }
+    const blobRadii = blobRadiiRef.current;
+
+    // Compute target radii from frequency data
+    for (let i = 0; i < BLOB_POINTS; i++) {
+      const angle = (i / BLOB_POINTS) * Math.PI * 2;
+      let targetR = BASE_RADIUS;
+
+      if (hasAudio && smoothed) {
+        // Symmetric mapping: 0→π = low→high freq, π→2π mirrors back
+        const halfAngle = angle <= Math.PI ? angle / Math.PI : (2 * Math.PI - angle) / Math.PI;
+        const binIdx = Math.floor(halfAngle * (smoothed.length - 1));
+        const binAmp = smoothed[binIdx] / 255;
+
+        // Base displacement from audio + organic wobble
+        const displacement = binAmp * (30 + amp * 50);
+        const wobble = Math.sin(angle * 3 + t * 1.5) * 8 * amp
+                     + Math.sin(angle * 5 - t * 2.3) * 4 * amp;
+
+        targetR = BASE_RADIUS + displacement + wobble;
+      } else {
+        // Idle breathing animation
+        targetR = BASE_RADIUS + Math.sin(angle * 3 + t * 0.8) * 4 + Math.sin(t * 0.5) * 6;
+      }
+
+      // Smooth interpolation for organic feel
+      blobRadii[i] += (targetR - blobRadii[i]) * 0.18;
+    }
+
+    // Compute blob outline points
+    const blobPoints: { x: number; y: number }[] = [];
+    for (let i = 0; i < BLOB_POINTS; i++) {
+      const angle = (i / BLOB_POINTS) * Math.PI * 2;
+      const r = blobRadii[i];
+      blobPoints.push({
+        x: cx + Math.cos(angle) * r,
+        y: cy + Math.sin(angle) * r,
+      });
+    }
+
+    // ── Radial frequency spikes ──────────────────────────────
+    // Lines radiating from center, length driven by frequency bins
+    const NUM_SPIKES = 180;
+    if (smoothed) {
+      for (let i = 0; i < NUM_SPIKES; i++) {
+        const angle = (i / NUM_SPIKES) * Math.PI * 2;
+
+        // Symmetric mapping: 0→π = low→high, π→2π mirrors back
+        const halfAngle = angle <= Math.PI ? angle / Math.PI : (2 * Math.PI - angle) / Math.PI;
+        const binIdx = Math.floor(halfAngle * (smoothed.length - 1));
+        const binAmp = smoothed[binIdx] / 255;
+
+        const innerR = BASE_RADIUS * 0.4;
+        const spikeLength = binAmp * (80 + amp * 160);
+        const outerR = innerR + spikeLength;
+
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
+
+        ctx.beginPath();
+        ctx.moveTo(cx + cos * innerR, cy + sin * innerR);
+        ctx.lineTo(cx + cos * outerR, cy + sin * outerR);
+
+        const spikeAlpha = 0.08 + binAmp * 0.35;
+        ctx.strokeStyle = `rgba(180, 220, 255, ${spikeAlpha})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+
+    // ── Radial light rays (longer, subtle, motion-blur feel) ──
+    if (smoothed) {
+      const NUM_RAYS = 64;
+      for (let i = 0; i < NUM_RAYS; i++) {
+        const rawAngle = (i / NUM_RAYS) * Math.PI * 2 + t * 0.1;
+        const angle = ((rawAngle % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+
+        const halfAngle = angle <= Math.PI ? angle / Math.PI : (2 * Math.PI - angle) / Math.PI;
+        const binIdx = Math.floor(Math.min(Math.max(halfAngle, 0), 0.999) * (smoothed.length - 1));
+        const binAmp = smoothed[binIdx] / 255;
+
+        const innerR = BASE_RADIUS * 0.6;
+        const outerR = innerR + binAmp * (200 + amp * 300);
+
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
+
+        // Gradient line from bright to transparent
+        const gradient = ctx.createLinearGradient(
+          cx + cos * innerR, cy + sin * innerR,
+          cx + cos * outerR, cy + sin * outerR,
+        );
+        gradient.addColorStop(0, `rgba(51, 204, 255, ${0.03 + binAmp * 0.12})`);
+        gradient.addColorStop(1, "rgba(51, 204, 255, 0)");
+
+        ctx.beginPath();
+        ctx.moveTo(cx + cos * innerR, cy + sin * innerR);
+        ctx.lineTo(cx + cos * outerR, cy + sin * outerR);
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 2 + binAmp * 2;
+        ctx.stroke();
+      }
+    }
+
+    // ── Concentric dotted rings ───────────────────────────────
+    for (let ring = 0; ring < NUM_RINGS; ring++) {
+      const ringRadius = BASE_RADIUS * (0.7 + ring * 0.5) + amp * 30 * ring;
+      const dotCount = 60 + ring * 20;
+      const dotSize = 1.2 + amp * 1.5;
+      const ringAlpha = (0.15 + amp * 0.25) * (1 - ring * 0.25);
+      const rotationSpeed = (ring % 2 === 0 ? 1 : -1) * (0.3 + ring * 0.15);
+
+      for (let d = 0; d < dotCount; d++) {
+        const angle = (d / dotCount) * Math.PI * 2 + t * rotationSpeed;
+        const dx = cx + Math.cos(angle) * ringRadius;
+        const dy = cy + Math.sin(angle) * ringRadius;
+
+        // Modulate dot size with nearby frequency
+        let sizeMultiplier = 1;
+        if (smoothed) {
+          const binIdx = Math.floor((d / dotCount) * (smoothed.length - 1));
+          sizeMultiplier = 1 + (smoothed[binIdx] / 255) * 1.5;
+        }
+
+        ctx.beginPath();
+        ctx.arc(dx, dy, dotSize * sizeMultiplier, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(51, 204, 255, ${ringAlpha})`;
+        ctx.fill();
+      }
+    }
+
+    // ── Inner glow fill ───────────────────────────────────────
+    ctx.beginPath();
+    for (let i = 0; i <= BLOB_POINTS; i++) {
+      const idx = i % BLOB_POINTS;
+      const next = (i + 1) % BLOB_POINTS;
+      const px = blobPoints[idx].x;
+      const py = blobPoints[idx].y;
+      const nx = blobPoints[next].x;
+      const ny = blobPoints[next].y;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.quadraticCurveTo(px, py, (px + nx) / 2, (py + ny) / 2);
+    }
+    ctx.closePath();
+
+    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, BASE_RADIUS + amp * 120);
+    grad.addColorStop(0, `rgba(51, 204, 255, ${0.08 + amp * 0.1})`);
+    grad.addColorStop(0.5, `rgba(51, 204, 255, ${0.03 + amp * 0.05})`);
+    grad.addColorStop(1, "rgba(51, 204, 255, 0)");
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // ── Blob outline ──────────────────────────────────────────
+    const drawBlobLayer = (radiusScale: number, color: string, lineWidth: number, blur: number) => {
+      ctx.beginPath();
+      for (let i = 0; i <= BLOB_POINTS; i++) {
+        const idx = i % BLOB_POINTS;
+        const next = (i + 1) % BLOB_POINTS;
+        const px = cx + (blobPoints[idx].x - cx) * radiusScale;
+        const py = cy + (blobPoints[idx].y - cy) * radiusScale;
+        const bx = cx + (blobPoints[next].x - cx) * radiusScale;
+        const by = cy + (blobPoints[next].y - cy) * radiusScale;
+
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.quadraticCurveTo(px, py, (px + bx) / 2, (py + by) / 2);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lineWidth;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = blur;
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    };
+
+    drawBlobLayer(1.0, `rgba(51, 204, 255, ${0.4 + amp * 0.5})`, 1.2 + amp * 0.8, 6 + amp * 12);
+    drawBlobLayer(0.92, `rgba(100, 220, 255, ${0.08 + amp * 0.15})`, 0.5, 3);
+
+    // ── Exclusion zone: max visual extent at each angle ──────
+    // Considers blob outline, spikes, rays, and dotted rings
+    const exclusionPoints: { x: number; y: number }[] = [];
+    for (let i = 0; i < BLOB_POINTS; i++) {
+      const angle = (i / BLOB_POINTS) * Math.PI * 2;
+      let maxR = blobRadii[i];
+
+      if (smoothed) {
+        const halfAngle = angle <= Math.PI ? angle / Math.PI : (2 * Math.PI - angle) / Math.PI;
+        const binIdx = Math.floor(halfAngle * (smoothed.length - 1));
+        const binAmp = smoothed[binIdx] / 255;
+
+        // Spike extent
+        const spikeOuterR = BASE_RADIUS * 0.4 + binAmp * (80 + amp * 160);
+        maxR = Math.max(maxR, spikeOuterR);
+
+        // Ray extent
+        const rayOuterR = BASE_RADIUS * 0.6 + binAmp * (200 + amp * 300);
+        maxR = Math.max(maxR, rayOuterR);
+      }
+
+      // Dotted ring extents
+      for (let ring = 0; ring < NUM_RINGS; ring++) {
+        const ringRadius = BASE_RADIUS * (0.7 + ring * 0.5) + amp * 30 * ring;
+        maxR = Math.max(maxR, ringRadius);
+      }
+
+      exclusionPoints.push({
+        x: cx + Math.cos(angle) * maxR,
+        y: cy + Math.sin(angle) * maxR,
+      });
+    }
+
+    // ── Text layout around blob (multi-column flow) ──────────
     const contentWidth = w - PADDING * 2;
-
-    // Layout text with wave displacement
     let cursor: LayoutCursor = { segmentIndex: 0, graphemeIndex: 0 };
     let y = PADDING;
-    const lines: {
+
+    type LineInfo = {
       text: string;
       x: number;
       y: number;
-      width: number;
-      displacement: number;
-      intensity: number;
-    }[] = [];
+      charStart: number;
+    };
+    const lines: LineInfo[] = [];
+    let charOffset = 0;
 
-    while (y + LINE_HEIGHT <= h - 60) {
-      const normalizedY = (y - PADDING) / (h - PADDING * 2);
-      let displacement = 0;
-      let intensity = 0;
+    // Find exclusion zone left/right extent at a given Y band
+    const getExclusionExtentAtY = (lineTop: number, lineBottom: number): { left: number; right: number } | null => {
+      let minX = Infinity;
+      let maxX = -Infinity;
+      let found = false;
 
-      if (hasAudio && freqData) {
-        // Map line position to frequency bins — bass at top, treble at bottom
-        const binIndex = Math.floor(normalizedY * freqData.length * 0.6);
-        const bin = Math.min(binIndex, freqData.length - 1);
+      const margin = 16;
 
-        // Average a few neighboring bins for smoother wave
-        let sum = 0;
-        let count = 0;
-        for (let i = Math.max(0, bin - 2); i <= Math.min(freqData.length - 1, bin + 2); i++) {
-          sum += freqData[i];
-          count++;
+      for (let i = 0; i < BLOB_POINTS; i++) {
+        const p = exclusionPoints[i];
+        if (p.y >= lineTop - margin && p.y <= lineBottom + margin) {
+          minX = Math.min(minX, p.x);
+          maxX = Math.max(maxX, p.x);
+          found = true;
         }
-        const freqValue = sum / count;
-        intensity = freqValue / 255;
-
-        // Wave displacement driven by audio
-        const wave1 = Math.sin(normalizedY * Math.PI * 2.5 + t * 1.8) * intensity;
-        const wave2 = Math.cos(normalizedY * Math.PI * 4 - t * 1.2) * intensity * 0.4;
-        displacement = (wave1 + wave2) * 100;
-      } else {
-        // Idle: gentle breathing wave
-        const wave = Math.sin(normalizedY * Math.PI * 2 + t * 0.6);
-        const wave2 = Math.sin(normalizedY * Math.PI * 3.5 - t * 0.4) * 0.4;
-        displacement = (wave + wave2) * 25;
-        intensity = 0.2 + Math.abs(wave) * 0.15;
       }
 
-      // Convert displacement to left margin
-      const absDisp = Math.abs(displacement);
-      const maxWidth = Math.max(80, contentWidth - absDisp);
-      let lineX: number;
+      if (!found) return null;
+      return { left: minX - margin, right: maxX + margin };
+    };
 
-      if (displacement > 0) {
-        lineX = PADDING + absDisp;
-      } else {
-        lineX = PADDING;
-      }
-
+    const emitLine = (lineX: number, maxWidth: number, atY: number): boolean => {
       const line = layoutNextLine(prepared, cursor, maxWidth);
-      if (!line) break;
+      if (!line) return false;
 
-      lines.push({
-        text: line.text,
-        x: lineX,
-        y,
-        width: line.width,
-        displacement,
-        intensity,
-      });
+      const idx = LYRICS_TEXT.indexOf(line.text, charOffset);
+      const charStart = idx >= 0 ? idx : charOffset;
+
+      lines.push({ text: line.text, x: lineX, y: atY, charStart });
+
+      charOffset = charStart + line.text.length;
+      while (charOffset < LYRICS_TEXT.length && (LYRICS_TEXT[charOffset] === " " || LYRICS_TEXT[charOffset] === "\n")) {
+        charOffset++;
+      }
+
       cursor = line.end;
-      y += LINE_HEIGHT;
+      return true;
+    };
+
+    while (y + lineHeight <= h - 80) {
+      const lineTop = y;
+      const lineBottom = y + lineHeight;
+
+      const extent = getExclusionExtentAtY(lineTop, lineBottom);
+
+      if (extent) {
+        const gap = 16;
+        const leftSpace = Math.max(0, extent.left - gap - PADDING);
+        const rightSpace = Math.max(0, w - PADDING - (extent.right + gap));
+
+        // Multi-column: flow text on both sides when possible
+        if (leftSpace > 60 && rightSpace > 60) {
+          if (!emitLine(PADDING, leftSpace, y)) break;
+          if (!emitLine(extent.right + gap, rightSpace, y)) break;
+        } else if (leftSpace > 60) {
+          if (!emitLine(PADDING, leftSpace, y)) break;
+        } else if (rightSpace > 60) {
+          if (!emitLine(extent.right + gap, rightSpace, y)) break;
+        }
+        // else skip this line (no room)
+      } else {
+        if (!emitLine(PADDING, contentWidth, y)) break;
+      }
+
+      y += lineHeight;
     }
 
-    // Draw wave glow behind text
-    if (lines.length > 1) {
-      // Broad glow
-      ctx.save();
-      ctx.beginPath();
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const px = w / 2 + line.displacement * 0.5;
-        const py = line.y + LINE_HEIGHT / 2;
-        if (i === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      }
-      const glowAlpha = hasAudio ? 0.12 : 0.04;
-      ctx.strokeStyle = `rgba(139, 92, 246, ${glowAlpha})`;
-      ctx.lineWidth = 60;
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      ctx.filter = "blur(8px)";
-      ctx.stroke();
-      ctx.filter = "none";
+    // ── Draw text (per-character with audio displacement) ─────
+    ctx.font = font;
+    ctx.textBaseline = "top";
 
-      // Thin accent line
-      ctx.beginPath();
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const px = w / 2 + line.displacement * 0.5;
-        const py = line.y + LINE_HEIGHT / 2;
-        if (i === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      }
-      const lineAlpha = hasAudio ? 0.35 : 0.08;
-      ctx.strokeStyle = `rgba(139, 92, 246, ${lineAlpha})`;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      ctx.restore();
+    // Pre-measure character widths
+    const charWidths: number[] = [];
+    for (let i = 32; i < 127; i++) {
+      charWidths[i] = ctx.measureText(String.fromCharCode(i)).width;
     }
+    const getCharWidth = (ch: string) => charWidths[ch.charCodeAt(0)] ?? ctx.measureText(ch).width;
 
-    // Draw text
-    ctx.font = FONT;
+    const wordCharStart = hasAudio && currentWordIdx >= 0 ? WORD_CHAR_STARTS[currentWordIdx] : -1;
+    const wordCharEnd = wordCharStart >= 0 ? wordCharStart + TIMED_WORDS[currentWordIdx].word.length : -1;
+    let currentWordX = -1;
+    let currentWordY = -1;
+
     for (const line of lines) {
-      const alpha = hasAudio
-        ? 0.4 + line.intensity * 0.6
-        : 0.55 + line.intensity * 0.3;
+      let xCursor = line.x;
 
-      // Subtle purple tint based on intensity
-      const r = Math.round(210 + line.intensity * 45);
-      const g = Math.round(210 - line.intensity * 30);
-      const b = Math.round(220 + line.intensity * 35);
-      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
-      ctx.fillText(line.text, line.x, line.y + LINE_HEIGHT - 8);
+      for (let ci = 0; ci < line.text.length; ci++) {
+        const ch = line.text[ci];
+        if (ch === "\n") continue; // skip newline chars
+        const globalCharIdx = line.charStart + ci;
+        const cw = getCharWidth(ch);
+
+        const isCurrent = globalCharIdx >= wordCharStart && globalCharIdx < wordCharEnd;
+        const isSung = hasAudio && wordCharStart >= 0 && globalCharIdx < wordCharStart;
+
+        // Audio-reactive displacement — based on distance to blob center
+        let dy = 0;
+        if (hasAudio && smoothed) {
+          const charX = xCursor;
+          const charY = line.y + lineHeight / 2;
+          const dx = charX - cx;
+          const ddy = charY - cy;
+          const dist = Math.sqrt(dx * dx + ddy * ddy);
+          const maxDist = Math.max(BASE_RADIUS * 3, 300);
+          const proximity = Math.max(0, 1 - dist / maxDist);
+
+          const nx = xCursor / w;
+          const binIdx = Math.floor(nx * (smoothed.length - 1));
+          const localAmp = smoothed[binIdx] / 255;
+
+          dy = localAmp * proximity * 8 * Math.sin(nx * Math.PI * 4 + t * 3 + ci * 0.3);
+        }
+
+        if (isCurrent) {
+          ctx.shadowColor = `rgba(51, 204, 255, ${0.3 + amp * 0.5})`;
+          ctx.shadowBlur = 6 + amp * 12;
+          ctx.fillStyle = "rgba(255, 255, 255, 1.0)";
+
+          const charCenterX = xCursor + cw / 2;
+          const charCenterY = line.y + lineHeight / 2;
+          ctx.save();
+          ctx.translate(charCenterX, charCenterY);
+          ctx.scale(wordScale, wordScale);
+          ctx.translate(-charCenterX, -charCenterY);
+          ctx.fillText(ch, xCursor, line.y + dy);
+          ctx.restore();
+          ctx.font = font;
+          ctx.shadowBlur = 0;
+        } else if (isSung) {
+          ctx.fillStyle = "rgba(130, 200, 230, 0.5)";
+          ctx.fillText(ch, xCursor, line.y + dy);
+        } else {
+          ctx.fillStyle = "rgba(200, 210, 220, 0.3)";
+          ctx.fillText(ch, xCursor, line.y + dy);
+        }
+
+        // Track position of current word's first character for particle spawning
+        if (isCurrent && globalCharIdx === wordCharStart) {
+          currentWordX = xCursor + cw / 2;
+          currentWordY = line.y + lineHeight / 2;
+        }
+
+        xCursor += cw;
+      }
+    }
+
+    // ── Particle system ──────────────────────────────────────
+    const particles = particlesRef.current;
+
+    // Spawn particles when a new word activates
+    if (currentWordIdx >= 0 && currentWordIdx !== lastWordIdxRef.current && currentWordX >= 0) {
+      lastWordIdxRef.current = currentWordIdx;
+      const count = 6 + Math.floor(amp * 10); // more particles on louder beats
+      for (let i = 0; i < count && particles.length < MAX_PARTICLES; i++) {
+        // Direction: from word toward blob center, with spread
+        const angle = Math.atan2(cy - currentWordY, cx - currentWordX) + (Math.random() - 0.5) * 1.8;
+        const speed = 1.5 + Math.random() * 3 + amp * 2;
+        particles.push({
+          x: currentWordX + (Math.random() - 0.5) * 20,
+          y: currentWordY + (Math.random() - 0.5) * 10,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          life: 0,
+          maxLife: 40 + Math.random() * 40,
+          size: 1 + Math.random() * 2,
+          alpha: 0.4 + Math.random() * 0.5,
+        });
+      }
+    }
+
+    // Update and draw particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.life += 1;
+      if (p.life >= p.maxLife) {
+        particles.splice(i, 1);
+        continue;
+      }
+
+      p.x += p.vx;
+      p.y += p.vy;
+
+      // Gentle pull toward blob center
+      const dx = cx - p.x;
+      const dy = cy - p.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > 1) {
+        p.vx += (dx / dist) * 0.08;
+        p.vy += (dy / dist) * 0.08;
+      }
+
+      // Slight drag
+      p.vx *= 0.985;
+      p.vy *= 0.985;
+
+      const lifeRatio = p.life / p.maxLife;
+      // Fade in quickly, fade out slowly
+      const fade = lifeRatio < 0.1 ? lifeRatio / 0.1 : 1 - (lifeRatio - 0.1) / 0.9;
+      const a = p.alpha * fade;
+
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * (1 - lifeRatio * 0.5), 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(51, 204, 255, ${a})`;
+      ctx.fill();
     }
 
     rafRef.current = requestAnimationFrame(draw);
-  }, [analyserRef, frequencyDataRef]);
+  }, [analyserRef, frequencyDataRef, audioRef]);
 
-  // Start render loop
   useEffect(() => {
     rafRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(rafRef.current);
   }, [draw]);
 
-  const handleFileDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      isDraggingRef.current = false;
-      const file = e.dataTransfer.files[0];
-      if (file && file.type.startsWith("audio/")) {
-        loadFile(file);
-      }
-    },
-    [loadFile]
-  );
-
-  const handleFileSelect = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (file) loadFile(file);
-    },
-    [loadFile]
-  );
-
   return (
-    <div className="relative w-full h-screen overflow-hidden bg-[#050505]">
-      <canvas
-        ref={canvasRef}
-        className="absolute inset-0 w-full h-full"
-        onDragOver={(e) => {
-          e.preventDefault();
-          isDraggingRef.current = true;
-        }}
-        onDragLeave={() => { isDraggingRef.current = false; }}
-        onDrop={handleFileDrop}
-      />
-
-      {/* Bottom controls */}
-      <div className="absolute bottom-0 left-0 right-0 p-6 flex items-end justify-between pointer-events-none">
-        <div className="flex items-center gap-3 pointer-events-auto">
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="px-4 py-2.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] backdrop-blur-md border border-white/[0.08] text-sm text-white/60 hover:text-white/80 transition-all cursor-pointer"
-          >
-            {fileName ?? "Load audio"}
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="audio/*"
-            className="hidden"
-            onChange={handleFileSelect}
-          />
-
-          {fileName && (
-            <button
-              onClick={isPlaying ? pause : play}
-              className="w-10 h-10 rounded-full bg-white/[0.06] hover:bg-white/[0.1] backdrop-blur-md border border-white/[0.08] flex items-center justify-center transition-all cursor-pointer text-white/60 hover:text-white/80"
-            >
-              {isPlaying ? (
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-                  <rect x="2" y="1" width="3.5" height="12" rx="1" />
-                  <rect x="8.5" y="1" width="3.5" height="12" rx="1" />
-                </svg>
-              ) : (
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
-                  <path d="M3 1.5v11l9-5.5z" />
-                </svg>
-              )}
-            </button>
-          )}
-        </div>
-
-        <button
-          onClick={() => setShowInput(!showInput)}
-          className="px-3 py-2.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] backdrop-blur-md border border-white/[0.08] text-xs text-white/50 hover:text-white/70 transition-all cursor-pointer pointer-events-auto"
-        >
-          {showInput ? "Close" : "Edit lyrics"}
-        </button>
-      </div>
-
-      {/* Lyrics editor panel */}
-      {showInput && (
-        <div className="absolute top-4 right-4 w-80 pointer-events-auto">
-          <textarea
-            value={lyrics}
-            onChange={(e) => setLyrics(e.target.value)}
-            className="w-full h-72 p-4 rounded-xl bg-black/70 backdrop-blur-md border border-white/[0.08] text-sm text-white/70 resize-none focus:outline-none focus:border-white/15 placeholder:text-white/20"
-            placeholder="Paste lyrics here..."
-          />
-        </div>
-      )}
-
-      {/* Title */}
-      <div className="absolute top-5 left-6 pointer-events-none">
-        <h1 className="text-[10px] font-mono text-white/20 tracking-[0.2em] uppercase">
-          Pretext Audio
-        </h1>
-      </div>
-    </div>
+    <canvas
+      ref={canvasRef}
+      className="absolute inset-0 w-full h-full"
+      style={{ zIndex: 10 }}
+    />
   );
 }

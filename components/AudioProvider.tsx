@@ -6,18 +6,19 @@ import {
   useRef,
   useState,
   useCallback,
-  useEffect,
   type ReactNode,
 } from "react";
 
 type AudioState = {
   isPlaying: boolean;
-  fileName: string | null;
+  currentTime: number;
+  duration: number;
   analyserRef: React.RefObject<AnalyserNode | null>;
   frequencyDataRef: React.RefObject<Uint8Array<ArrayBuffer> | null>;
+  audioRef: React.RefObject<HTMLAudioElement | null>;
   play: () => void;
   pause: () => void;
-  loadFile: (file: File) => void;
+  seek: (time: number) => void;
 };
 
 const AudioCtx = createContext<AudioState | null>(null);
@@ -31,110 +32,77 @@ export function useAudio() {
 export function AudioProvider({ children }: { children: ReactNode }) {
   const audioCtxRef = useRef<globalThis.AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const bufferRef = useRef<AudioBuffer | null>(null);
-  const startTimeRef = useRef<number>(0);
-  const offsetRef = useRef<number>(0);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const sourceCreatedRef = useRef(false);
   const frequencyDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
-  const [fileName, setFileName] = useState<string | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
 
-  const ensureContext = useCallback(() => {
-    if (!audioCtxRef.current) {
+  const ensureAnalyser = useCallback(() => {
+    if (!audioCtxRef.current && audioRef.current) {
       const ctx = new window.AudioContext();
       const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.75;
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.82;
       analyser.connect(ctx.destination);
+
+      const source = ctx.createMediaElementSource(audioRef.current);
+      source.connect(analyser);
+
       audioCtxRef.current = ctx;
       analyserRef.current = analyser;
       frequencyDataRef.current = new Uint8Array(analyser.frequencyBinCount);
+      sourceCreatedRef.current = true;
     }
-    return audioCtxRef.current;
   }, []);
 
   const play = useCallback(() => {
-    const ctx = ensureContext();
-    const buffer = bufferRef.current;
-    if (!buffer) return;
-
-    if (sourceRef.current) {
-      try { sourceRef.current.stop(); } catch {}
+    const audio = audioRef.current;
+    if (!audio) return;
+    ensureAnalyser();
+    if (audioCtxRef.current?.state === "suspended") {
+      audioCtxRef.current.resume();
     }
-
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(analyserRef.current!);
-    source.onended = () => {
-      setIsPlaying(false);
-      offsetRef.current = 0;
-    };
-
-    source.start(0, offsetRef.current);
-    startTimeRef.current = ctx.currentTime - offsetRef.current;
-    sourceRef.current = source;
+    audio.play();
     setIsPlaying(true);
-  }, [ensureContext]);
+  }, [ensureAnalyser]);
 
   const pause = useCallback(() => {
-    if (sourceRef.current && audioCtxRef.current) {
-      offsetRef.current = audioCtxRef.current.currentTime - startTimeRef.current;
-      try { sourceRef.current.stop(); } catch {}
-      sourceRef.current = null;
-    }
+    audioRef.current?.pause();
     setIsPlaying(false);
   }, []);
 
-  const loadFile = useCallback(
-    (file: File) => {
-      const ctx = ensureContext();
-      setFileName(file.name.replace(/\.[^.]+$/, ""));
-      offsetRef.current = 0;
-
-      if (sourceRef.current) {
-        try { sourceRef.current.stop(); } catch {}
-        sourceRef.current = null;
-      }
-      setIsPlaying(false);
-
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const arrayBuffer = e.target?.result as ArrayBuffer;
-        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-        bufferRef.current = audioBuffer;
-
-        // Auto-play
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(analyserRef.current!);
-        source.onended = () => {
-          setIsPlaying(false);
-          offsetRef.current = 0;
-        };
-        source.start(0);
-        startTimeRef.current = ctx.currentTime;
-        sourceRef.current = source;
-        setIsPlaying(true);
-      };
-      reader.readAsArrayBuffer(file);
-    },
-    [ensureContext]
-  );
+  const seek = useCallback((time: number) => {
+    if (audioRef.current) {
+      audioRef.current.currentTime = time;
+    }
+  }, []);
 
   return (
     <AudioCtx.Provider
       value={{
         isPlaying,
-        fileName,
+        currentTime,
+        duration,
         analyserRef,
         frequencyDataRef,
+        audioRef,
         play,
         pause,
-        loadFile,
+        seek,
       }}
     >
       {children}
+      <audio
+        ref={audioRef}
+        src="/song.mp3"
+        preload="auto"
+        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+        onEnded={() => setIsPlaying(false)}
+      />
     </AudioCtx.Provider>
   );
 }

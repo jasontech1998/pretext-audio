@@ -3,9 +3,6 @@
 :root {
   --background: #050505;
   --foreground: #e5e5e5;
-  --muted: #a3a3a3;
-  --accent: #8b5cf6;
-  --accent-glow: #a78bfa;
 }
 
 * {
@@ -19,6 +16,13 @@ html, body {
   overflow: hidden;
   background: var(--background);
   color: var(--foreground);
-  font-family: Inter, system-ui, -apple-system, sans-serif;
+  font-family: system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
+  cursor: default;
+  user-select: none;
 }
+
+::-webkit-scrollbar {
+  display: none;
+}
+
